@@ -1,544 +1,432 @@
 #!/usr/bin/env python3
 """
 UAV Coverage Path Planner
-
-This module implements the Boustrophedon decomposition algorithm for 
-generating efficient coverage paths for unmanned aerial vehicles (UAVs).
-
-The algorithm generates parallel sweep lines across a polygonal area,
-optimizing coverage for surveillance, mapping, or spraying applications.
-
-Author: qzhou711
-Date: 2021-06-02
+Boustrophedon decomposition algorithm for UAV coverage path planning
+Compatible with NumPy 2.0+ and Shapely 2.0+
 """
 
-from shapely.geometry import Point, Polygon, LineString
-from shapely.geometry import MultiLineString, MultiPoint, GeometryCollection
-from shapely.errors import TopologicalError
+from shapely.geometry import (
+    Point, Polygon, LineString, MultiLineString, 
+    MultiPoint, GeometryCollection
+)
+from shapely.errors import TopologicalError, ShapelyError
+from shapely.validation import make_valid
 import numpy as np
 import matplotlib.pyplot as plt
-from logging import error
-from math import atan
+import logging
 from typing import List, Tuple, Optional
+from dataclasses import dataclass
 
+# ============================ 常量定义 ============================
+DEFAULT_PATH_SPACING = 1.0
+ROTATION_OFFSET_DEG = 90
+MIN_POLYGON_AREA = 1e-6
+LOGGING_LEVEL = logging.INFO
+
+# ============================ 日志配置 ============================
+logging.basicConfig(
+    level=LOGGING_LEVEL,
+    format="[%(levelname)s] %(asctime)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+logger = logging.getLogger(__name__)
+
+# ============================ 数据类定义 ============================
+@dataclass(frozen=True)
+class RotationParams:
+    angle_deg: float
+    angle_rad: float
+    rotation_matrix: np.ndarray  # 纯ndarray，无np.matrix
 
 # =============================================================================
-# Rotation Transform Class
+# Rotation Transform Class (完全移除np.matrix)
 # =============================================================================
-
 class RotationTransform:
-    """
-    Represents a 2D rotation transformation.
-    
-    Used to rotate polygon coordinates for optimizing coverage path direction.
-    The rotation angle is computed based on the polygon's longest edge
-    to minimize the number of required coverage passes.
-    
-    Attributes:
-        angle: Rotation angle in degrees
-        w: Internal angle in radians (for matrix computation)
-        irm: 3x3 rotation matrix
-    """
-    
     def __init__(self, angle: float):
-        """
-        Initialize rotation transform with specified angle.
-        
-        Args:
-            angle: Rotation angle in degrees
-        """
-        self.angle = angle
-        # Convert to radians (90-degree offset for coordinate system alignment)
-        self.w = np.radians(90 - angle)
-        
-        # Build 3x3 rotation matrix for 2D transformation
-        self.irm = np.mat([
-            [np.cos(self.w), -np.sin(self.w), 0.0],
-            [np.sin(self.w),  np.cos(self.w), 0.0],
-            [0.0,             0.0,             1.0]
-        ], dtype='float')
+        if not isinstance(angle, (int, float)):
+            raise TypeError(f"Rotation angle must be numeric, got {type(angle)}")
+        self._params = self._compute_rotation_params(angle)
+
+    def _compute_rotation_params(self, angle: float) -> RotationParams:
+        angle_rad = np.radians(ROTATION_OFFSET_DEG - angle)
+        # ✅ 关键修复1：使用np.array替代np.matrix
+        rotation_matrix = np.array([
+            [np.cos(angle_rad), -np.sin(angle_rad), 0.0],
+            [np.sin(angle_rad),  np.cos(angle_rad), 0.0],
+            [0.0,                0.0,              1.0]
+        ], dtype=np.float64)
+        return RotationParams(
+            angle_deg=angle,
+            angle_rad=angle_rad,
+            rotation_matrix=rotation_matrix
+        )
+    
+    @property
+    def angle(self) -> float:
+        return self._params.angle_deg
+    
+    @property
+    def rotation_matrix(self) -> np.ndarray:
+        return self._params.rotation_matrix
     
     def __repr__(self) -> str:
         return f"RotationTransform(angle={self.angle:.1f}°)"
 
-
 # =============================================================================
 # Main Area Polygon Class
 # =============================================================================
-
 class AreaPolygon:
-    """
-    Represents a polygon area for coverage path planning.
-    
-    This class implements the Boustrophedon decomposition algorithm,
-    which divides a polygonal area into cells and generates efficient
-    parallel sweep paths for complete coverage.
-    
-    The algorithm:
-    1. Computes optimal path direction based on longest edge
-    2. Rotates polygon to align with path direction
-    3. Generates parallel sweep lines across the area
-    4. Orders the sweep lines to minimize travel distance
-    5. Returns the final coverage path
-    
-    Attributes:
-        P: Original polygon (shapely Polygon)
-        rP: Rotated polygon
-        rtf: Rotation transform
-        origin: Starting point for coverage path
-        ft: Path spacing (swath width)
-    """
-    
     def __init__(
         self,
         coordinates: List[Tuple[float, float]],
         initial_pos: Tuple[float, float],
-        interior: List[List[Tuple[float, float]]] = None,
-        ft: float = 1.0,
-        angle: Optional[float] = None
+        interior: Optional[List[List[Tuple[float, float]]]] = None,
+        path_spacing: float = DEFAULT_PATH_SPACING,
+        fixed_angle: Optional[float] = None
     ):
-        """
-        Initialize the area polygon for coverage planning.
-        
-        Args:
-            coordinates: List of (x, y) tuples defining outer boundary
-            initial_pos: Initial UAV position (x, y)
-            interior: List of holes (each hole is a list of (x, y) tuples)
-            ft: Path spacing (swath width between parallel lines)
-            angle: Fixed path angle in degrees (None = auto-compute)
-        """
-        # Initialize polygon with optional holes
         interior = interior or []
-        self.P = Polygon(coordinates, interior)
+        self._validate_coordinates(coordinates, "Exterior")
+        for idx, hole in enumerate(interior):
+            self._validate_coordinates(hole, f"Hole {idx}")
+        self._validate_initial_pos(initial_pos)
         
-        # Compute rotation transform
-        if angle:
-            # Use provided angle
-            self.rtf = RotationTransform(angle)
-        else:
-            # Auto-compute based on longest edge
-            self.rtf = self._compute_longest_edge_transform()
+        self.P = self._create_valid_polygon(coordinates, interior)
+        if self.P.area < MIN_POLYGON_AREA:
+            raise ValueError(f"Polygon area too small: {self.P.area:.6f}")
         
-        # Rotate polygon for path planning
-        self.rP = self._rotate_polygon()
+        self.rtf = self._get_rotation_transform(fixed_angle)
+        logger.info(f"Using rotation angle: {self.rtf.angle:.1f}°")
         
-        # Find optimal starting point (closest vertex to initial position)
-        self.origin = self._get_closest_vertex(self.P.exterior.coords, initial_pos)[0]
-        print(f"[INFO] Starting point: {self.origin}")
+        self.rP = self._rotate_polygon_safely()
         
-        # Store path spacing
-        self.ft = ft
-    
+        self.origin = self._get_closest_vertex(
+            list(self.P.exterior.coords), initial_pos
+        )
+        logger.info(f"Optimal starting point: {self.origin}")
+        
+        self.path_spacing = self._validate_path_spacing(path_spacing)
+
     # -------------------------------------------------------------------------
-    # Rotation Transform Methods
+    # 输入校验方法
     # -------------------------------------------------------------------------
-    
+    @staticmethod
+    def _validate_coordinates(coords: List[Tuple[float, float]], name: str):
+        if not isinstance(coords, list) or len(coords) < 3:
+            raise ShapelyError(f"{name} must have at least 3 points")
+        for (x, y) in coords:
+            if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
+                raise TypeError(f"{name} coordinates must be (float, float)")
+
+    @staticmethod
+    def _validate_initial_pos(pos: Tuple[float, float]):
+        if not isinstance(pos, tuple) or len(pos) != 2:
+            raise TypeError("Initial position must be (x, y) tuple")
+        if not all(isinstance(p, (int, float)) for p in pos):
+            raise TypeError("Initial position coordinates must be numeric")
+
+    @staticmethod
+    def _validate_path_spacing(spacing: float) -> float:
+        if not isinstance(spacing, (int, float)) or spacing <= 0:
+            raise ValueError(f"Path spacing must be positive, got {spacing}")
+        return float(spacing)
+
+    @staticmethod
+    def _create_valid_polygon(exterior: List[Tuple[float, float]], interior: List[List[Tuple[float, float]]]) -> Polygon:
+        try:
+            poly = Polygon(exterior, interior)
+            return make_valid(poly) if not poly.is_valid else poly
+        except (TopologicalError, ShapelyError) as e:
+            raise ShapelyError(f"Failed to create valid polygon: {str(e)}")
+
+    # -------------------------------------------------------------------------
+    # 旋转变换方法 (完全兼容NumPy 2.0)
+    # -------------------------------------------------------------------------
+    def _get_rotation_transform(self, fixed_angle: Optional[float]) -> RotationTransform:
+        if fixed_angle is not None:
+            return RotationTransform(fixed_angle)
+        return self._compute_longest_edge_transform()
+
     def _compute_longest_edge_transform(self) -> RotationTransform:
-        """
-        Compute rotation angle based on polygon's longest edge.
-        
-        This optimization minimizes the number of required coverage passes
-        by aligning the sweep direction with the polygon's longest dimension.
-        
-        Returns:
-            RotationTransform object
-        """
         coords = list(self.P.exterior.coords)
         n = len(coords)
         
-        # Calculate edge lengths
-        edge_lengths = [
-            Point(coords[i]).distance(Point(coords[(i + 1) % n]))
-            for i in range(n)
-        ]
+        edge_lengths = []
+        for i in range(n):
+            p1 = coords[i]
+            p2 = coords[(i + 1) % n]
+            length = Point(p1).distance(Point(p2))
+            edge_lengths.append((length, i, p1, p2))
         
-        # Find longest edge
-        max_idx = edge_lengths.index(max(edge_lengths))
-        print(f"[INFO] Longest edge at index: {max_idx}")
+        longest_edge = max(edge_lengths, key=lambda x: x[0])
+        logger.info(f"Longest edge at index {longest_edge[1]} (length: {longest_edge[0]:.2f})")
         
-        # Compute angle from edge vector
-        p1 = coords[max_idx]
-        p2 = coords[(max_idx + 1) % n]
-        dy = float(p2[1] - p1[1])
-        dx = float(p2[0] - p1[0])
+        dy = float(longest_edge[3][1] - longest_edge[2][1])
+        dx = float(longest_edge[3][0] - longest_edge[2][0])
         
-        angle = np.degrees(np.arctan([dy / dx]))
+        if dx == 0:
+            angle = 90.0 if dy > 0 else -90.0
+        else:
+            angle = np.degrees(np.arctan(dy / dx))
+        
         return RotationTransform(angle)
-    
+
     def _rotate_points(self, points: np.ndarray) -> np.ndarray:
-        """
-        Apply rotation transform to a set of points.
-        
-        Args:
-            points: Numpy array of shape (N, 2) containing (x, y) coordinates
-            
-        Returns:
-            Rotated points as numpy array
-        """
-        rotated = []
-        for point in points:
-            # Convert to column vector
-            point_mat = np.mat([[point[0]], [point[1]], [0]], dtype='float64')
-            
-            # Apply rotation matrix
-            new_point = self.rtf.irm * point_mat
-            
-            # Extract 2D coordinates
-            rotated.append(np.array(new_point[:-1].T, dtype='float64'))
-        
-        return np.squeeze(np.array(rotated, dtype='float64'))
-    
+        """✅ 关键修复2：纯ndarray向量化旋转，无嵌套矩阵"""
+        points = np.atleast_2d(points).astype(np.float64)
+        # 转换为齐次坐标 (N, 3)
+        homogeneous = np.hstack([points, np.ones((points.shape[0], 1), dtype=np.float64)])
+        # 矩阵乘法结果为纯ndarray
+        rotated_homogeneous = homogeneous @ self.rtf.rotation_matrix.T
+        # 提取2D坐标，确保返回(N, 2)形状
+        return rotated_homogeneous[:, :2]
+
     def _rotate_from(self, points: np.ndarray) -> np.ndarray:
-        """
-        Rotate points in reverse (apply inverse transform).
-        
-        Args:
-            points: Numpy array of shape (N, 2)
-            
-        Returns:
-            Rotated points in original coordinate system
-        """
+        """✅ 关键修复3：使用np.linalg.inv替代matrix.I属性"""
         if not isinstance(points, np.ndarray):
             raise TypeError("rotate_from requires numpy.ndarray input")
         
-        rotated = []
-        for point in points:
-            point_mat = np.mat([[point[0]], [point[1]], [0]], dtype='float64')
-            
-            # Apply inverse rotation matrix
-            new_point = self.rtf.irm.I * point_mat
-            rotated.append(np.array(new_point[:-1].T, dtype='float64'))
-        
-        return np.squeeze(np.array(rotated, dtype='float64'))
-    
-    def _rotate_polygon(self) -> Polygon:
-        """
-        Apply rotation transform to the polygon and its holes.
-        
-        Returns:
-            Rotated Shapely Polygon
-        """
-        # Rotate exterior boundary
-        exterior_points = np.array(self.P.exterior)
-        rotated_exterior = self._rotate_points(exterior_points)
-        
-        # Rotate holes (if any)
-        rotated_holes = []
-        for hole in self.P.interiors:
-            rotated_holes.append(self._rotate_points(np.array(hole)))
-        
-        return self._arrays_to_polygon(rotated_exterior, rotated_holes)
-    
-    def _arrays_to_polygon(
-        self,
-        exterior: np.ndarray,
-        holes: List[np.ndarray]
-    ) -> Polygon:
-        """
-        Convert numpy arrays to Shapely Polygon.
-        
-        Args:
-            exterior: Numpy array of exterior coordinates
-            holes: List of numpy arrays for hole coordinates
-            
-        Returns:
-            Shapely Polygon object
-        """
-        new_exterior = [(float(p[0]), float(p[1])) for p in exterior]
-        new_interiors = []
-        
-        for hole in holes:
-            new_holes = [(float(p[0]), float(p[1])) for p in hole]
-            new_interiors.append(new_holes)
-        
-        return Polygon(new_exterior, new_interiors)
-    
-    # -------------------------------------------------------------------------
-    # Path Generation Methods
-    # -------------------------------------------------------------------------
-    
-    def _generate_sweep_lines(self) -> List[LineString]:
-        """
-        Generate parallel sweep lines across the rotated polygon.
-        
-        Creates equally-spaced parallel lines that cover the entire
-        polygon area. The spacing is determined by the ft parameter.
-        
-        Returns:
-            List of Shapely LineStrings representing sweep lines
-        """
-        # Get bounding box of rotated polygon
-        min_x, min_y, max_x, max_y = self.rP.bounds
-        
-        # Create initial sweep line from bottom of bounding box
-        start_point = (min_x, min_y)
-        end_point = (min_x, max_y)
-        sweep_line = LineString([start_point, end_point])
-        
-        # Find intersection with polygon
+        points = np.atleast_2d(points).astype(np.float64)
+        homogeneous = np.hstack([points, np.ones((points.shape[0], 1), dtype=np.float64)])
+        # 计算逆矩阵（ndarray标准方法）
+        inv_rot_matrix = np.linalg.inv(self.rtf.rotation_matrix)
+        rotated_homogeneous = homogeneous @ inv_rot_matrix.T
+        return rotated_homogeneous[:, :2]
+
+    def _rotate_polygon_safely(self) -> Polygon:
         try:
-            initial_line = self.rP.intersection(sweep_line)
+            # 旋转外边界
+            exterior_np = np.array(self.P.exterior.coords)
+            exterior_rot = self._rotate_points(exterior_np)
+            # ✅ 关键修复4：确保坐标是纯Python浮点数元组
+            exterior_list = [(float(p[0]), float(p[1])) for p in exterior_rot]
+            
+            # 旋转内部孔洞
+            interiors_list = []
+            for hole in self.P.interiors:
+                hole_np = np.array(hole.coords)
+                hole_rot = self._rotate_points(hole_np)
+                hole_list = [(float(p[0]), float(p[1])) for p in hole_rot]
+                interiors_list.append(hole_list)
+            
+            return self._create_valid_polygon(exterior_list, interiors_list)
+        except Exception as e:
+            raise TopologicalError(f"Failed to rotate polygon: {str(e)}")
+
+    # -------------------------------------------------------------------------
+    # 扫掠线生成方法
+    # -------------------------------------------------------------------------
+    def _generate_base_sweep_line(self) -> LineString:
+        min_x, min_y, max_x, max_y = self.rP.bounds
+        return LineString([(min_x, min_y), (min_x, max_y)])
+
+    def _generate_single_sweep_line(self, base_line: LineString, offset: float) -> Optional[LineString]:
+        try:
+            offset_line = base_line.parallel_offset(offset, 'right')
+            if not self.rP.intersects(offset_line):
+                return None
+            
+            intersection = self.rP.intersection(offset_line)
+            if isinstance(intersection, (GeometryCollection, Point, MultiPoint)):
+                return None
+            return intersection
         except TopologicalError:
-            error("[ERROR] Failed to compute initial intersection")
+            logger.warning(f"Failed to compute intersection for offset {offset}")
+            return None
+
+    def _generate_sweep_lines(self) -> List[LineString]:
+        min_x, _, max_x, _ = self.rP.bounds
+        base_line = self._generate_base_sweep_line()
+        
+        try:
+            initial_line = self.rP.intersection(base_line)
+            lines = [initial_line] if initial_line else []
+        except TopologicalError:
+            logger.error("Failed to compute initial sweep line")
             return []
         
-        lines = [initial_line]
-        
-        # Generate parallel lines at specified spacing
-        num_lines = int((max_x - min_x) / self.ft) + 2
+        num_lines = int((max_x - min_x) / self.path_spacing) + 2
         
         for i in range(1, num_lines):
-            # Offset line to the right
-            offset_line = sweep_line.parallel_offset(i * self.ft, 'right')
-            
-            # Check if line intersects polygon
-            if not self.rP.intersects(offset_line):
+            offset = i * self.path_spacing
+            line = self._generate_single_sweep_line(base_line, offset)
+            if not line:
                 continue
             
-            try:
-                # Compute exact intersection
-                intersection = self.rP.intersection(offset_line)
-                
-                # Handle different geometry types
-                if isinstance(intersection, GeometryCollection):
-                    continue
-                elif isinstance(intersection, MultiLineString):
-                    for ln in intersection.geoms:
-                        lines.append(ln)
-                else:
-                    lines.append(intersection)
-                    
-            except TopologicalError:
-                error(f"[ERROR] Intersection failed at line {i}")
-                continue
+            if isinstance(line, MultiLineString):
+                lines.extend(line.geoms)
+            else:
+                lines.append(line)
         
-        return lines
-    
+        valid_lines = [ln for ln in lines if isinstance(ln, LineString) and ln.length > 0]
+        logger.info(f"Generated {len(valid_lines)} valid sweep lines")
+        return valid_lines
+
+    # -------------------------------------------------------------------------
+    # 路径排序方法
+    # -------------------------------------------------------------------------
     def _get_closest_vertex(
         self,
         vertices: List[Tuple[float, float]],
         reference: Tuple[float, float]
-    ) -> List[Tuple[float, float]]:
-        """
-        Sort vertices by distance to a reference point.
-        
-        Args:
-            vertices: List of (x, y) coordinate tuples
-            reference: Reference point (x, y)
-            
-        Returns:
-            Sorted list of vertices
-        """
-        ref_point = Point(*reference)
-        return sorted(vertices, key=lambda v: ref_point.distance(Point(*v)))
-    
+    ) -> Tuple[float, float]:
+        ref_point = Point(reference)
+        return min(vertices, key=lambda v: ref_point.distance(Point(v)))
+
+    def _sort_lines_by_distance(self, lines: List[LineString], reference: Tuple[float, float]):
+        ref_point = Point(reference)
+        lines.sort(key=lambda ln: ref_point.distance(ln))
+
+    def _check_path_obstacle(self, line: LineString) -> bool:
+        for hole in self.rP.interiors:
+            intersection = hole.intersection(line)
+            if isinstance(intersection, LineString) and intersection.length > 0:
+                logger.warning("Path intersects with hole")
+                return True
+        return False
+
     def _order_sweep_lines(
         self,
         lines: List[LineString],
         start_point: Tuple[float, float]
     ) -> List[Tuple[float, float]]:
-        """
-        Order sweep lines to create efficient coverage path.
-        
-        Uses a nearest-neighbor approach to minimize travel distance
-        between consecutive coverage segments.
-        
-        Args:
-            lines: List of sweep line geometries
-            start_point: Starting position (x, y)
-            
-        Returns:
-            Ordered list of waypoints
-        """
         waypoints = []
         current_pos = start_point
+        remaining_lines = lines.copy()
         
-        while lines:
-            # Sort lines by distance to current position
-            self._sort_by_distance(lines, current_pos)
+        while remaining_lines:
+            self._sort_lines_by_distance(remaining_lines, current_pos)
+            current_line = remaining_lines.pop(0)
             
-            # Get next line
-            if not lines:
-                break
-                
-            line = lines.pop(0)
-            
-            # Skip invalid geometries
-            if isinstance(line, (GeometryCollection, Point, MultiPoint)):
-                continue
-            
-            # Handle multi-line geometries
-            if isinstance(line, MultiLineString):
-                for ln in line.geoms:
-                    lines.append(ln)
-                continue
-            
-            # Get endpoints of line segment
-            xs, ys = line.xy
+            xs, ys = current_line.xy
             endpoints = list(zip(xs, ys))
+            if len(endpoints) < 2:
+                logger.warning("Skipping invalid line")
+                continue
             
-            # Find endpoint farthest from current position (determines direction)
-            direction_point = self._get_closest_vertex(endpoints, current_pos)[0]
+            closest_end = self._get_closest_vertex(endpoints, current_pos)
+            farthest_end = endpoints[1] if closest_end == endpoints[0] else endpoints[0]
             
-            # Check for obstacles (holes)
-            current_line = LineString([current_pos, direction_point])
-            for hole in self.rP.interiors:
-                if isinstance(hole.intersection(current_line), LineString):
-                    print(f"[WARNING] Path intersects hole, skipping segment")
+            path_segment = LineString([current_pos, closest_end])
+            if self._check_path_obstacle(path_segment):
+                continue
             
-            # Add waypoints
             waypoints.append(current_pos)
-            waypoints.append(direction_point)
-            
-            # Update current position to end of segment
-            current_pos = self._get_closest_vertex(endpoints, direction_point)[1]
+            waypoints.append(closest_end)
+            current_pos = farthest_end
         
-        return waypoints
-    
-    def _sort_by_distance(
-        self,
-        lines: List[LineString],
-        reference: Tuple[float, float]
-    ):
-        """
-        Sort a list of lines by their distance to a reference point.
+        # 去重连续重复航点
+        if not waypoints:
+            return []
+        deduped = [waypoints[0]]
+        for wp in waypoints[1:]:
+            if abs(wp[0] - deduped[-1][0]) > 1e-6 or abs(wp[1] - deduped[-1][1]) > 1e-6:
+                deduped.append(wp)
         
-        In-place sorting operation.
-        
-        Args:
-            lines: List of LineString objects
-            reference: Reference point (x, y)
-        """
-        lines.sort(key=lambda ln: ln.distance(Point(*reference)))
-    
+        logger.info(f"Generated {len(deduped)} waypoints")
+        return deduped
+
     # -------------------------------------------------------------------------
-    # Public Methods
+    # 公共方法
     # -------------------------------------------------------------------------
-    
-    def generate_coverage_path(self, origin: Tuple[float, float] = None) -> LineString:
-        """
-        Generate the complete coverage path for this polygon.
-        
-        This is the main public method that orchestrates the entire
-        path planning algorithm.
-        
-        Args:
-            origin: Optional starting point (x, y). If None, uses 
-                   the vertex closest to initial position.
-            
-        Returns:
-            Shapely LineString representing the coverage path
-        """
-        # Handle origin rotation
-        if origin:
-            # Convert origin to rotated coordinate system
-            origin = self._rotate_points(np.array([origin])).tolist()[0]
+    def generate_coverage_path(self, custom_origin: Optional[Tuple[float, float]] = None) -> LineString:
+        if custom_origin:
+            rotated_origin = self._rotate_points(np.array([custom_origin]))[0]
+            rotated_origin = (float(rotated_origin[0]), float(rotated_origin[1]))
         else:
-            # Use pre-computed optimal origin
-            origin = self._rotate_points(np.array([self.origin])).tolist()[0]
+            rotated_origin = self._rotate_points(np.array([self.origin]))[0]
+            rotated_origin = (float(rotated_origin[0]), float(rotated_origin[1]))
         
-        # Generate sweep lines
         sweep_lines = self._generate_sweep_lines()
+        if not sweep_lines:
+            raise RuntimeError("No valid sweep lines generated")
         
-        # Order sweep lines for efficient coverage
-        waypoints = self._order_sweep_lines(sweep_lines, origin)
+        waypoints_rotated = self._order_sweep_lines(sweep_lines, rotated_origin)
+        if not waypoints_rotated:
+            raise RuntimeError("No valid waypoints generated")
         
-        # Convert to numpy array
-        waypoint_array = np.array(waypoints, dtype='float')
+        waypoint_array = np.array(waypoints_rotated, dtype=np.float64)
+        waypoints_original = self._rotate_from(waypoint_array)
         
-        # Rotate back to original coordinate system
-        final_path = self._rotate_from(waypoint_array)
+        # 确保最终坐标是纯浮点数
+        final_waypoints = [(float(p[0]), float(p[1])) for p in waypoints_original]
+        final_path = LineString(final_waypoints)
         
-        return LineString(final_path)
-
+        if not final_path.is_valid:
+            final_path = make_valid(final_path)
+        
+        logger.info(f"Final path length: {final_path.length:.2f} meters")
+        return final_path
 
 # =============================================================================
-# Visualization Utilities
+# 可视化工具
 # =============================================================================
-
-def plot_coordinates(ax, geometry):
-    """Plot point coordinates as markers."""
+def plot_coordinates(ax, geometry, marker_size: int = 3):
     x, y = geometry.xy
-    ax.plot(x, y, 'o', color='#999999', zorder=1)
+    ax.plot(x, y, 'o', color='#999999', markersize=marker_size, zorder=1)
 
-
-def plot_boundary(ax, geometry):
-    """Plot boundary points."""
-    x, y = zip(*[(p.x, p.y) for p in geometry.boundary])
-    ax.plot(x, y, 'o', color='#000000', zorder=1)
-
-
-def plot_path(ax, geometry, color='blue', linewidth=3):
-    """Plot a path/line with styling."""
+def plot_path(ax, geometry, color: str = 'blue', linewidth: float = 2.0, alpha: float = 0.7):
     x, y = geometry.xy
     ax.plot(
         x, y,
-        alpha=0.7,
+        alpha=alpha,
         linewidth=linewidth,
         solid_capstyle='round',
         color=color,
         zorder=2
     )
 
-
 # =============================================================================
-# Main Execution
+# 主执行逻辑
 # =============================================================================
-
 if __name__ == '__main__':
-    print("[UAV Coverage Path Planner]")
-    print("=" * 50)
+    logger.info("=== UAV Coverage Path Planner ===")
     
-    # Define polygon with hole
-    # Exterior boundary (pentagon-like shape)
+    # 测试多边形（带有效孔洞）
     exterior = [(0, 0), (4, 4), (0, 8), (-4, 4), (-9, 3)]
+    holes = [[(-2, 3), (-1, 4), (0, 3), (-1, 2)]]  # 有效四边形孔洞
     
-    # Interior hole (optional)
-    holes = [[(0, 0), (0, 0), (0, 0), (0, 0)]]  # Empty hole
-    
-    # Create area polygon for coverage planning
-    # Parameters:
-    #   - exterior: polygon boundary coordinates
-    #   - (-5, 10): initial UAV position
-    #   - ft=0.5: path spacing (swath width)
-    #   - angle=30: fixed path angle in degrees
-    polygon = AreaPolygon(
-        exterior,
-        (-5, 10),
-        interior=holes,
-        ft=0.5,
-        angle=30
-    )
-    
-    print(f"[INFO] Rotation angle: {polygon.rtf.angle:.1f}°")
-    
-    # Generate coverage path starting from origin (0, 0)
-    coverage_path = polygon.generate_coverage_path(origin=(0.0, 0.0))
-    
-    # Visualize results
-    fig = plt.figure(1, dpi=90)
-    ax = fig.add_subplot(121)
-    
-    # Plot rotated polygon (coverage frame)
-    plt.plot(*polygon.rP.exterior.xy, 'b-', linewidth=2, label='Coverage Area')
-    
-    # Plot coverage path
-    plot_coordinates(ax, coverage_path)
-    plot_boundary(ax, coverage_path)
-    plot_path(ax, coverage_path, color='red')
-    
-    # Plot original polygon
-    plt.plot(*polygon.P.exterior.xy, 'g--', linewidth=1, label='Original')
-    
-    # Set equal aspect ratio
-    plt.gca().set_aspect('equal', adjustable='box')
-    plt.legend()
-    plt.title("UAV Coverage Path Planning\n(Boustrophedon Decomposition)")
-    plt.xlabel("X (meters)")
-    plt.ylabel("Y (meters)")
-    
-    plt.tight_layout()
-    plt.show()
-    
-    print("[INFO] Path generation complete!")
-    print(f"[INFO] Path contains {len(list(coverage_path.coords))} waypoints")
+    try:
+        polygon = AreaPolygon(
+            coordinates=exterior,
+            initial_pos=(-5, 10),
+            interior=holes,
+            path_spacing=0.5,
+            fixed_angle=30
+        )
+        
+        coverage_path = polygon.generate_coverage_path(custom_origin=(0.0, 0.0))
+        
+        # 可视化
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6), dpi=90)
+        
+        # 旋转坐标系
+        ax1.plot(*polygon.rP.exterior.xy, 'b-', linewidth=2, label='Rotated Area')
+        for hole in polygon.rP.interiors:
+            ax1.plot(*hole.xy, 'k-', linewidth=1)
+        plot_path(ax1, coverage_path, color='red')
+        plot_coordinates(ax1, coverage_path)
+        ax1.set_title("Rotated Coordinate System")
+        ax1.set_aspect('equal', adjustable='box')
+        ax1.legend()
+        ax1.grid(alpha=0.3)
+        
+        # 原始坐标系
+        ax2.plot(*polygon.P.exterior.xy, 'g--', linewidth=2, label='Original Area')
+        for hole in polygon.P.interiors:
+            ax2.plot(*hole.xy, 'k-', linewidth=1)
+        plot_path(ax2, coverage_path, color='red')
+        plot_coordinates(ax2, coverage_path)
+        ax2.set_title("Original Coordinate System")
+        ax2.set_aspect('equal', adjustable='box')
+        ax2.legend()
+        ax2.grid(alpha=0.3)
+        
+        fig.suptitle("UAV Coverage Path Planning (Boustrophedon Decomposition)", fontsize=14)
+        plt.tight_layout()
+        plt.show()
+        
+        logger.info("Path generation completed successfully!")
+        logger.info(f"Total waypoints: {len(list(coverage_path.coords))}")
+        
+    except Exception as e:
+        logger.error(f"Failed to generate path: {str(e)}", exc_info=True)
